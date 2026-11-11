@@ -1,58 +1,26 @@
 // ============================================================================
-// MMU Part-of-Memory TLB (POM-TLB) Implementation
+// MMU NEST (Near-Memory Translation with RLDRAM Cuckoo Hashing)
 // ============================================================================
-//
-// This file implements an MMU variant with a Part-of-Memory TLB (POM-TLB)
-// for the Sniper multi-core simulator. The POM-TLB is a software-managed TLB
-// that stores translations in main memory, providing much larger capacity
-// than hardware TLBs at the cost of memory access latency.
-//
-// Reference:
-// ~~~~~~~~~~
-//   Ryoo et al. "Rethinking TLB designs in virtualized environments:
-//   A very large part-of-memory TLB" - ISCA 2017
-//   https://ieeexplore.ieee.org/document/8192494
-//
-// Key Features:
-// ~~~~~~~~~~~~~
-//   1. Standard hardware TLB hierarchy (L1 iTLB, L1 dTLB, L2 TLB)
-//   2. Software-managed TLB stored in main memory (POM-TLB)
-//   3. One POM-TLB per supported page size (4KB, 2MB, etc.)
-//   4. Falls back to full page table walk only on POM-TLB miss
 //
 // Architecture Overview:
 // ~~~~~~~~~~~~~~~~~~~~~~
-//   +--------+     +-----------+     +------------+
-//   |  Core  | --> |  MMU POM  | --> |   Memory   |
-//   +--------+     +-----------+     +------------+
-//                       |
-//         +-------------+-------------+
-//         |             |             |
-//    +----v----+   +----v----+   +----v----+
-//    |   TLB   |   | POM-TLB |   |   PTW   |
-//    | Subsys  |   | (DRAM)  |   |         |
-//    +---------+   +---------+   +---------+
-//         |             |             |
-//         +------+------+             |
-//                |                    |
-//         Fast   |                    |  Slow
-//         (SRAM) |                    |  (DRAM)
-//                v                    v
+//   +--------+     +------------+     +------------+
+//   |  Core  | --> |  MMU NEST  | --> |   Memory   |
+//   +--------+     +------------+     +------------+
+//                        |
+//          +-------------+-------------+
+//          |             |             |
+//     +----v----+   +----v----+   +----v----+
+//     | HW TLBs |   |  NEST   |   |   PTW   |
+//     | (SRAM)  |   | (RLDRAM)|   | (DRAM)  |
+//     +---------+   +---------+   +---------+
 //
 // Translation Flow:
 // ~~~~~~~~~~~~~~~~~
-//   1. Lookup hardware TLB hierarchy
-//   2. On HW TLB miss: Lookup POM-TLB (parallel lookup for each page size)
-//   3. On POM-TLB miss: Perform full page table walk
-//   4. Allocate translation in both HW TLBs and POM-TLBs
-//
-// POM-TLB Memory Layout:
-// ~~~~~~~~~~~~~~~~~~~~~~
-//   - Each POM-TLB is set-associative, stored contiguously in DRAM
-//   - Entry size = tag_size + 52 bits (physical address + metadata)
-//   - Tag size = 48 - page_offset - log2(num_sets)
-//   - Base address stored in software_tlb_base_register[]
-//
+//   1. Lookup HW TLB hierarchy (L1 iTLB, L1 dTLB, L2 TLB)
+//   2. On HW TLB miss: Parallel lookup in NEST 4-bank Cuckoo Table (10 ns)
+//   3. On NEST miss: Fall back to Page Table Walk in main DRAM
+//   4. On PTW completion: Populate HW TLBs and NEST Cuckoo Table
 // ============================================================================
 
 #include "mmu_nest.h"
@@ -106,14 +74,10 @@ namespace ParametricDramDirectoryMSI
 	: MemoryManagementUnitBase(_core, _memory_manager, _shmem_perf_model, _name, _nested_mmu),
 	  memory_manager(_memory_manager),
 	  m_nest_tables(nullptr),
-	  m_num_page_sizes(0),
-	  m_pom_tlb(nullptr),
-	  software_tlb_base_register(nullptr),
-	  m_size(nullptr),
-	  m_associativity(nullptr)
+	  m_num_page_sizes(0)
 	{
 		// SimLog for debug output
-		mmu_pomtlb_log = new SimLog("MMU_NEST", core->getId(), DEBUG_MMU_POMTLB);
+		mmu_nest_log = new SimLog("MMU_NEST", core->getId(), DEBUG_MMU_POMTLB);
 
 		instantiatePageTableWalker();  // Creates PWC filter and PTW MSHRs
 		instantiateTLBSubsystem();     // Creates HW TLB hierarchy and POM-TLBs
@@ -127,7 +91,7 @@ namespace ParametricDramDirectoryMSI
      */
 	MemoryManagementUnitNEST::~MemoryManagementUnitNEST()
 	{
-		delete mmu_pomtlb_log;
+		delete mmu_nest_log;
 		delete tlb_subsystem;
 		delete pt_walkers;
 		delete[] translation_stats.tlb_latency_per_level;
@@ -136,22 +100,10 @@ namespace ParametricDramDirectoryMSI
 		{
 			for (int i = 0; i < m_num_page_sizes; i++)
 			{
-				const NestCuckooTable::Stats &st = m_nest_tables[i]->getStats();
-				std::cout << "\n================ NEST STATS (Page size " << m_nest_tables[i]->getPageSize() << ") ================\n"
-				          << "  Lookups    : " << st.lookups << "\n"
-				          << "  Hits       : " << st.hits << " (" << (st.lookups ? (100.0 * st.hits / st.lookups) : 0.0) << "%)\n"
-				          << "  Misses     : " << st.misses << "\n"
-				          << "  Insertions : " << st.insertions << "\n"
-				          << "  Evictions  : " << st.evictions << "\n"
-				          << "=========================================================\n" << std::endl;
 				delete m_nest_tables[i];
 			}
 			delete[] m_nest_tables;
 		}
-		delete[] m_pom_tlb;
-		delete[] software_tlb_base_register;
-		delete[] m_size;
-		delete[] m_associativity;
 	}
 
 // ============================================================================
@@ -202,62 +154,6 @@ namespace ParametricDramDirectoryMSI
 	{
 		// Create standard hardware TLB hierarchy
 		tlb_subsystem = new TLBHierarchy(name, core, memory_manager, shmem_perf_model);
-
-		// Read POM-TLB configuration
-		int page_sizes = Sim()->getCfg()->getInt("perf_model/nest/page_sizes");
-
-		// Allocate arrays for POM-TLB tracking
-		software_tlb_base_register = new IntPtr[page_sizes];
-		m_pom_tlb = new TLB*[page_sizes];
-
-		// Create one POM-TLB per page size
-		for (int i = 0; i < page_sizes; i++)
-		{
-			int page_size = Sim()->getCfg()->getIntArray("perf_model/nest/page_size_list", i);
-			int entries   = Sim()->getCfg()->getIntArray("perf_model/nest/entries", i);
-			int assoc     = Sim()->getCfg()->getIntArray("perf_model/nest/assoc", i);
-			String type   = Sim()->getCfg()->getStringArray("perf_model/nest/type", i);
-			bool allocate_on_miss = Sim()->getCfg()->getBoolArray("perf_model/nest/allocate_on_miss", i);
-
-			String name = "pom_tlb_" + itostr(i);
-
-			int num_sets = entries / assoc;
-
-			// Calculate entry size for POM-TLB
-			// Tag = 48-bit VA - page_offset - log2(num_sets)
-			// Entry = tag + 52 bits (PPN + metadata)
-			int tag_size   = (48 - page_size - log2(num_sets)); 
-			int entry_size = tag_size + 52;
-
-			// Allocate memory for POM-TLB in physical memory
-			// Size = entries * entry_size bits, converted to bytes
-			software_tlb_base_register[i] = Sim()->getMimicOS()->getMemoryAllocator()->handle_page_table_allocations(
-				ceil(entries * entry_size / 8.0));
-
-			int* page_size_list = new int[1];
-			page_size_list[0] = page_size;
-
-			std::cout << "[MMU:POM-TLB] Allocating software TLB for page size: " 
-			          << page_size << " with " << entries << " entries and " 
-			          << assoc << " ways and " << num_sets << " sets" << std::endl;
-			std::cout << "[MMU:POM-TLB] Entry size: " << entry_size << std::endl;
-			std::cout << "[MMU:POM-TLB] Tag size: " << tag_size << std::endl;
-			std::cout << "[MMU:POM-TLB] Type: " << type << std::endl;
-			std::cout << "[MMU:POM-TLB] Allocate on miss: " << allocate_on_miss << std::endl;
-			std::cout << "[MMU:POM-TLB] Base register: " << software_tlb_base_register[i] << std::endl;
-
-			// Create the POM-TLB object (no fixed latency - latency comes from DRAM access)
-			m_pom_tlb[i] = new TLB(name,
-			                       "perf_model/nest",
-			                       core->getId(),
-			                       ComponentLatency(core->getDvfsDomain(), 0),
-			                       entries,
-			                       assoc,
-			                       page_size_list,
-			                       1,  // #page sizes in this TLB
-			                       type,
-			                       allocate_on_miss);
-		}
 
 		m_num_page_sizes = Sim()->getCfg()->getInt("perf_model/nest/page_sizes");
 		m_nest_tables = new NestCuckooTable*[m_num_page_sizes];
@@ -373,11 +269,8 @@ namespace ParametricDramDirectoryMSI
 		// Track DRAM accesses for power/performance analysis
 		dram_accesses_during_last_walk = 0;
 
-		mmu_pomtlb_log->debug("[MMU:POM-TLB] ---- Starting address translation for virtual address: %lx ---- at time %s",
+		mmu_nest_log->debug("[MMU:NEST] ---- Starting address translation for virtual address: %lx ---- at time %s",
 			address, shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS());
-
-		int number_of_page_sizes = Sim()->getMimicOS()->getNumberOfPageSizes();
-		int *page_size_list = Sim()->getMimicOS()->getPageSizeList();
 
 		SubsecondTime time = shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD);
 
@@ -406,7 +299,7 @@ namespace ParametricDramDirectoryMSI
 		// Search hardware TLB hierarchy
 		for (UInt32 i = 0; i < tlbs.size(); i++)
 		{
-			mmu_pomtlb_log->debug("[MMU] Searching TLB at level: %u", i);
+			mmu_nest_log->debug("[MMU] Searching TLB at level: %u", i);
 			for (UInt32 j = 0; j < tlbs[i].size(); j++)
 			{
 				bool tlb_stores_instructions = ((tlbs[i][j]->getType() == TLBtype::Instruction) ||
@@ -441,7 +334,7 @@ namespace ParametricDramDirectoryMSI
 			}
 			if (tlb_hit)
 			{
-				mmu_pomtlb_log->debug("[MMU] TLB Hit at level: %d at TLB %s", hit_level, hit_tlb->getName().c_str());
+				mmu_nest_log->debug("[MMU] TLB Hit at level: %d at TLB %s", hit_level, hit_tlb->getName().c_str());
 				break;
 			}
 		}
@@ -458,8 +351,6 @@ namespace ParametricDramDirectoryMSI
 			page_size_result = tlb_block_info_hit->getPageSize();
 			ppn_result       = tlb_block_info_hit->getPPN();
 
-			mmu_pomtlb_log->debug("[MMU] TLB Hit ? %d at level: %d at TLB: %s", tlb_hit, hit_level, hit_tlb->getName().c_str());
-
 			if (instruction)
 				tlbs = tlb_subsystem->getInstructionPath();
 			else
@@ -473,7 +364,6 @@ namespace ParametricDramDirectoryMSI
 				{
 					tlb_latency[i] = max(tlbs[i][j]->getLatency(), tlb_latency[i]);
 				}
-				mmu_pomtlb_log->debug("[MMU] Charging TLB Latency: %lu at level: %d", tlb_latency[i].getNS(), i);
 				translation_stats.total_tlb_latency += tlb_latency[i];
 				translation_stats.tlb_latency_per_level[i] += tlb_latency[i];
 				charged_tlb_latency += tlb_latency[i];
@@ -486,7 +376,6 @@ namespace ParametricDramDirectoryMSI
 					translation_stats.total_tlb_latency += hit_tlb->getLatency();
 					charged_tlb_latency += hit_tlb->getLatency();
 					translation_stats.tlb_latency_per_level[hit_level] += hit_tlb->getLatency();
-					mmu_pomtlb_log->debug("[MMU] Charging TLB Hit Latency: %lu at level: %d", hit_tlb->getLatency().getNS(), hit_level);
 				}
 			}
 
@@ -495,7 +384,6 @@ namespace ParametricDramDirectoryMSI
 			if (count)
 				translation_stats.total_translation_latency += charged_tlb_latency;
 
-			mmu_pomtlb_log->debug("[MMU] New time after charging TLB latency: %lu", shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS());
 		}
 		else
 		{
@@ -503,7 +391,6 @@ namespace ParametricDramDirectoryMSI
 			 * 2a) TLB Miss => sum the latency for all TLB levels. We do not break out at a 
 			 *     partial level because we "visited" them all searching for a hit.
 			 */
-			mmu_pomtlb_log->debug("[MMU] TLB Miss");
 			SubsecondTime tlb_latency[tlbs.size()];
 
 			for (UInt32 i = 0; i < tlbs.size(); i++)
@@ -512,7 +399,7 @@ namespace ParametricDramDirectoryMSI
 				{
 					tlb_latency[i] = max(tlbs[i][j]->getLatency(), tlb_latency[i]);
 				}
-				mmu_pomtlb_log->debug("[MMU] Charging TLB Latency: %lu at level: %u", tlb_latency[i].getNS(), i);
+				mmu_nest_log->debug("[MMU] Charging TLB Latency: %lu at level: %u", tlb_latency[i].getNS(), i);
 				translation_stats.total_tlb_latency += tlb_latency[i];
 				charged_tlb_latency += tlb_latency[i];
 			}
@@ -521,7 +408,7 @@ namespace ParametricDramDirectoryMSI
 			if (count)
 				translation_stats.total_translation_latency += charged_tlb_latency;
 
-			mmu_pomtlb_log->debug("[MMU] New time after charging TLB latency: %lu", shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS());
+			mmu_nest_log->debug("[MMU] New time after charging TLB latency: %lu", shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS());
 		}
 
 		/*
@@ -529,17 +416,10 @@ namespace ParametricDramDirectoryMSI
 		 *    page size in 'm_pom_tlb' to see if we have a hit. We measure the access latencies
 		 *    (software_tlb_latency[i]) and pick either the one that hits or the max if all miss.
 		 */
-		CacheBlockInfo *software_tlb_block_info = NULL;
-		bool software_tlb_hit = false;
+		bool nest_hit = false;
 
-		SubsecondTime time_before_software_tlb = shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD);
-		SubsecondTime software_tlb_latency[number_of_page_sizes];
-		for (int i = 0; i < number_of_page_sizes; i++)
-		{
-			software_tlb_latency[i] = SubsecondTime::Zero();
-		}
-
-		SubsecondTime final_software_tlb_latency = SubsecondTime::Zero();
+		SubsecondTime time_before_nest = shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD);
+		SubsecondTime charged_nest_latency = SubsecondTime::Zero();
 
 		if (!tlb_hit)
 		{
@@ -554,7 +434,7 @@ namespace ParametricDramDirectoryMSI
 
 				if (m_nest_tables[i]->lookup(vpn, ppn_found))
 				{
-					software_tlb_hit = true;
+					nest_hit = true;
 					ppn_result = ppn_found;
 					page_size_result = ps;
 					if (count)
@@ -563,19 +443,19 @@ namespace ParametricDramDirectoryMSI
 				}
 			}
 
-			if (!software_tlb_hit && count)
+			if (!nest_hit && count)
 				translation_stats.nest_misses++;
 
-			final_software_tlb_latency = SubsecondTime::NS(10);
+			charged_nest_latency = SubsecondTime::NS(10);
 
 			if (count)
-				translation_stats.software_tlb_latency += final_software_tlb_latency;
+				translation_stats.software_tlb_latency += charged_nest_latency;
 
 			shmem_perf_model->setElapsedTime(ShmemPerfModel::_USER_THREAD,
-				time_before_software_tlb + final_software_tlb_latency);
+				time_before_nest + charged_nest_latency);
 
 			if (count)
-				translation_stats.total_translation_latency += final_software_tlb_latency;
+				translation_stats.total_translation_latency += charged_nest_latency;
 			
 		}
 
@@ -587,7 +467,7 @@ namespace ParametricDramDirectoryMSI
 		SubsecondTime total_fault_latency = SubsecondTime::Zero();
 		SubsecondTime total_walk_latency  = SubsecondTime::Zero();
 
-		if (!tlb_hit && !software_tlb_hit)
+		if (!tlb_hit && !nest_hit)
 		{
 			SubsecondTime time_for_pt = shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD);
 
@@ -599,8 +479,6 @@ namespace ParametricDramDirectoryMSI
 			shmem_perf_model->setElapsedTime(ShmemPerfModel::_USER_THREAD, time_for_pt + delay);
 			if(count)
 				translation_stats.total_translation_latency += delay;
-
-			mmu_pomtlb_log->debug("[MMU] New time after charging the PT walker allocation delay: %lu ns", shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS());
 
 			// Perform the PT walk
 			int app_id = core->getThread()->getAppId();
@@ -620,8 +498,6 @@ namespace ParametricDramDirectoryMSI
 			do {
 				ptw_result = performPTW(address, modeled, count, false, eip, lock, page_table, restart_walk_upon_page_fault, instruction);
 
-mmu_pomtlb_log->debug("[MMU] PTW Result: %lu %d %lx %d", ptw_result.latency.getNS(), ptw_result.page_fault, ptw_result.ppn, ptw_result.page_size);
-
 			total_walk_latency = ptw_result.latency;
 			if (count)
 			{
@@ -633,13 +509,13 @@ mmu_pomtlb_log->debug("[MMU] PTW Result: %lu %d %lx %d", ptw_result.latency.getN
 			if (caused_page_fault)
 			{
 				had_page_fault = true;  // Track that a fault occurred
-				mmu_pomtlb_log->debug("[MMU] Page Fault occured");
+				mmu_nest_log->debug("[MMU] Page Fault occured");
 				translation_stats.page_faults++;
 				
 				// Handle page fault at MMU level (sniper-space mode)
 				if (!userspace_mimicos_enabled)
 				{
-					mmu_pomtlb_log->debug("[MMU] Handling page fault in sniper-space mode, calling exception handler");
+					mmu_nest_log->debug("[MMU] Handling page fault in sniper-space mode, calling exception handler");
 					ExceptionHandlerBase *handler = Sim()->getCoreManager()->getCoreFromID(core->getId())->getExceptionHandler();
 
 					ExceptionHandlerBase::FaultCtx fault_ctx{};
@@ -648,7 +524,7 @@ mmu_pomtlb_log->debug("[MMU] PTW Result: %lu %d %lx %d", ptw_result.latency.getN
 					fault_ctx.alloc_in.metadata_frames = ptw_result.requested_frames;
 					handler->handle_page_fault(fault_ctx);
 					
-					mmu_pomtlb_log->debug("[MMU] Page fault handled, restarting PTW for address: %lx", address);
+					mmu_nest_log->debug("[MMU] Page fault handled, restarting PTW for address: %lx", address);
 					// Loop will retry PTW after fault is handled
 				}
 			}
@@ -690,11 +566,7 @@ mmu_pomtlb_log->debug("[MMU] PTW Result: %lu %d %lx %d", ptw_result.latency.getN
 			ppn_result       = ptw_result.ppn;
 			page_size_result = ptw_result.page_size;
 
-mmu_pomtlb_log->debug("[MMU] New time after charging the PT walker completion time: %lu", shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS());
 		}
-
-mmu_pomtlb_log->debug("[MMU] Total Walk Latency: %lu", total_walk_latency.getNS());
-		mmu_pomtlb_log->debug("[MMU] Total Fault Latency: %lu", total_fault_latency.getNS());
 
 		// 5) Allocate the translation in intermediate TLB levels (if needed).
 		if (instruction)
@@ -710,7 +582,6 @@ mmu_pomtlb_log->debug("[MMU] Total Walk Latency: %lu", total_walk_latency.getNS(
 		if (tlb_subsystem->isPrefetchEnabled())
 		{
 			tlb_levels = tlbs.size() - 1;
-			mmu_pomtlb_log->debug("[MMU] Prefetching is enabled");
 		}
 
 		// For each TLB level, we insert or attempt to insert the final translation 
@@ -724,16 +595,16 @@ mmu_pomtlb_log->debug("[MMU] Total Walk Latency: %lu", total_walk_latency.getNS(
 				{
 					TLBAllocResult result;
 
-					mmu_pomtlb_log->debug("[MMU] There are evicted translations from level: %d", (i - 1));
+					mmu_nest_log->debug("[MMU] There are evicted translations from level: %d", (i - 1));
 					for (const EvictedTranslation &evicted : evicted_translations[i - 1])
 					{
-						mmu_pomtlb_log->debug("[MMU] Evicted Translation: %lx", evicted.address);
+						mmu_nest_log->debug("[MMU] Evicted Translation: %lx", evicted.address);
 						IntPtr evicted_address = evicted.address;
 						int evicted_page_size = evicted.page_size;
 						IntPtr evicted_ppn = evicted.ppn;
 						if (tlbs[i][j]->supportsPageSize(evicted_page_size))
 						{
-							mmu_pomtlb_log->debug("[MMU] Allocating evicted entry in TLB: Level = %d Index =  %d", i, j);
+							mmu_nest_log->debug("[MMU] Allocating evicted entry in TLB: Level = %d Index =  %d", i, j);
 							result = tlbs[i][j]->allocate(evicted_address, time, count, lock,
 							                              evicted_page_size, evicted_ppn);
 
@@ -752,8 +623,8 @@ mmu_pomtlb_log->debug("[MMU] Total Walk Latency: %lu", total_walk_latency.getNS(
 				    && tlbs[i][j]->getAllocateOnMiss()
 				    && (!tlb_hit || (tlb_hit && hit_level > i)))
 				{
-					mmu_pomtlb_log->debug("[MMU] %s supports page size: %d", tlbs[i][j]->getName().c_str(), page_size_result);
-					mmu_pomtlb_log->debug("[MMU] Allocating in TLB: Level = %d Index = %d with page size: %d and VPN: %lx", i, j, page_size_result, (address >> page_size_result));
+					mmu_nest_log->debug("[MMU] %s supports page size: %d", tlbs[i][j]->getName().c_str(), page_size_result);
+					mmu_nest_log->debug("[MMU] Allocating in TLB: Level = %d Index = %d with page size: %d and VPN: %lx", i, j, page_size_result, (address >> page_size_result));
 					TLBAllocResult result = tlbs[i][j]->allocate(address, time, count, lock, page_size_result, ppn_result);
 					if (result.evicted)
 					{
@@ -768,7 +639,7 @@ mmu_pomtlb_log->debug("[MMU] Total Walk Latency: %lu", total_walk_latency.getNS(
 		 * 6) Allocate the translation in the software TLB if we had a miss there. 
 		 *    We check each software TLB if it supports page_size_result and is "allocate on miss."
 		 */
-		if (!software_tlb_hit && !tlb_hit)
+		if (!nest_hit && !tlb_hit)
 		{
 			for (int i = 0; i < m_num_page_sizes; i++)
 			{
@@ -782,7 +653,7 @@ mmu_pomtlb_log->debug("[MMU] Total Walk Latency: %lu", total_walk_latency.getNS(
 						if (evicted)
 							translation_stats.nest_evictions++;
 					}
-					mmu_pomtlb_log->debug("[MMU:NEST] Inserted VPN=%lx -> PPN=%lx in L3 table after PTW", vpn, ppn_result);
+					mmu_nest_log->debug("[MMU:NEST] Inserted VPN=%lx -> PPN=%lx in L3 table after PTW", vpn, ppn_result);
 					break;
 				}
 			}
@@ -802,11 +673,9 @@ mmu_pomtlb_log->debug("[MMU] Total Walk Latency: %lu", total_walk_latency.getNS(
 		IntPtr final_physical_address = (ppn_result * base_page_size_in_bytes)
 		                                + (address % page_size_in_bytes);
 
-mmu_pomtlb_log->debug("[MMU] Offset: %lx", (address % page_size_in_bytes));
-		mmu_pomtlb_log->debug("[MMU] Physical Address: %lx PPN: %lx Page Size: %d", final_physical_address, ppn_result*base_page_size_in_bytes, page_size_result);
-		mmu_pomtlb_log->debug("[MMU] Total translation latency: %lu", (charged_tlb_latency + final_software_tlb_latency + total_walk_latency).getNS());
-		mmu_pomtlb_log->debug("[MMU] Total fault latency: %lu", total_fault_latency.getNS());
-		mmu_pomtlb_log->debug("[MMU] ---- Ending address translation for virtual address: %lx ----", address);
+		mmu_nest_log->debug("[MMU] Physical Address: %lx PPN: %lx Page Size: %d", final_physical_address, ppn_result*base_page_size_in_bytes, page_size_result);
+		mmu_nest_log->debug("[MMU] Total translation latency: %lu", (charged_tlb_latency + charged_nest_latency + total_walk_latency).getNS());
+		mmu_nest_log->debug("[MMU] ---- Ending address translation for virtual address: %lx ----", address);
 
 		return final_physical_address;
 	}

@@ -105,6 +105,9 @@ namespace ParametricDramDirectoryMSI
 			}
 
 			int getPageSize() const { return m_page_size; }
+			Stats* getStatsPtr() { return &m_stats; }
+    		const Stats& getStats() const { return m_stats; }
+			void resetStats() { m_stats = Stats{0, 0, 0, 0, 0}; }
 
 			bool lookup(IntPtr vpn, IntPtr &out_ppn)
 			{
@@ -165,8 +168,6 @@ namespace ParametricDramDirectoryMSI
 
 				return true;
 			}
-			void resetStats() { m_stats = Stats{0, 0, 0, 0, 0}; }
-    		const Stats& getStats() const { return m_stats; }
 	};
 
 	class MemoryManagementUnitNEST : public MemoryManagementUnitBase
@@ -182,19 +183,11 @@ namespace ParametricDramDirectoryMSI
 		NestCuckooTable **m_nest_tables;
 		int m_num_page_sizes;
 
-
-		TLB **m_pom_tlb;
-		int pom_tlb_entry_size;
-		IntPtr *software_tlb_base_register;
-		UInt32 *m_size;
-		UInt32 *m_associativity;
-
-		SimLog *mmu_pomtlb_log;
+		SimLog *mmu_nest_log;
 
 		struct
 		{
 			UInt64 num_translations;
-
 			UInt64 page_faults;
 			UInt64 page_table_walks;
 
