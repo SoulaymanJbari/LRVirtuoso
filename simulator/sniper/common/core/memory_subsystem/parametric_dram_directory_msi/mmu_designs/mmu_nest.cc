@@ -202,6 +202,7 @@ namespace ParametricDramDirectoryMSI
 		registerStatsMetric(name, core->getId(), "nest_hits", &translation_stats.nest_hits);
 		registerStatsMetric(name, core->getId(), "nest_misses", &translation_stats.nest_misses);
 		registerStatsMetric(name, core->getId(), "nest_insertions", &translation_stats.nest_insertions);
+		registerStatsMetric(name, core->getId(), "nest_kicks", &translation_stats.nest_kicks);
 		registerStatsMetric(name, core->getId(), "nest_evictions", &translation_stats.nest_evictions);
 
 		// Per-level TLB latency statistics
@@ -646,10 +647,12 @@ namespace ParametricDramDirectoryMSI
 				if (m_nest_tables[i]->getPageSize() == page_size_result)
 				{
 					IntPtr vpn = address >> page_size_result;
-					bool evicted = m_nest_tables[i]->insert(vpn, ppn_result);
+					size_t kicks = 0;
+					bool evicted = m_nest_tables[i]->insert(vpn, ppn_result, &kicks);
 					if (count)
 					{
 						translation_stats.nest_insertions++;
+						translation_stats.nest_kicks += kicks;
 						if (evicted)
 							translation_stats.nest_evictions++;
 					}

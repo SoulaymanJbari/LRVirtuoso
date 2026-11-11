@@ -26,6 +26,8 @@ namespace ParametricDramDirectoryMSI
 	{
 		public:
 			static constexpr size_t NUM_BANKS = 4;
+			static constexpr size_t MAX_KICKS = 8;
+
 			struct Entry
 			{
 				bool valid;
@@ -42,6 +44,7 @@ namespace ParametricDramDirectoryMSI
 				UInt64 misses;
 				UInt64 insertions;
 				UInt64 evictions;
+				UInt64 kicks;
 			};
 		private:
 			int m_page_size;
@@ -51,33 +54,31 @@ namespace ParametricDramDirectoryMSI
 			uint8_t m_evict_counter;
 			Stats m_stats;
 
+			static inline uint64_t mix64(uint64_t z)
+			{
+				z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+				z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+				return z ^ (z >> 31);
+			}
+
 			size_t hash0(IntPtr vpn) const
 			{
-				uint64_t x = static_cast<uint64_t>(vpn);
-				x ^= (x >> 16);
-				return static_cast<size_t>(x % m_entries_per_bank);
+				return static_cast<size_t>(mix64(static_cast<uint64_t>(vpn) ^ 0x517cc1b727220a95ULL) % m_entries_per_bank);
 			}
 
 			size_t hash1(IntPtr vpn) const
 			{
-				uint64_t x = static_cast<uint64_t>(vpn) * 0x9e3779b97f4a7c15ULL;
-				x ^= (x >> 21);
-				return static_cast<size_t>(x % m_entries_per_bank);
+				return static_cast<size_t>(mix64(static_cast<uint64_t>(vpn) ^ 0x9e3779b97f4a7c15ULL) % m_entries_per_bank);
 			}
 
 			size_t hash2(IntPtr vpn) const
 			{
-				uint64_t x = static_cast<uint64_t>(vpn) * 0xbf58476d1ce4e5b9ULL;
-				x ^= (x >> 27);
-				return static_cast<size_t>(x % m_entries_per_bank);
+				return static_cast<size_t>(mix64(static_cast<uint64_t>(vpn) ^ 0xbf58476d1ce4e5b9ULL) % m_entries_per_bank);
 			}
 
 			size_t hash3(IntPtr vpn) const
 			{
-				uint64_t x = static_cast<uint64_t>(vpn);
-				x = (x << 13) | (x >> 51);
-				x ^= 0x94d049bb133111ebULL;
-				return static_cast<size_t>(x % m_entries_per_bank);
+				return static_cast<size_t>(mix64(static_cast<uint64_t>(vpn) ^ 0x3141592653589793ULL) % m_entries_per_bank);
 			}
 
 			size_t getIndex(size_t bank, IntPtr vpn) const
@@ -127,10 +128,12 @@ namespace ParametricDramDirectoryMSI
 				return false;
 			}
 
-			bool insert(IntPtr vpn, IntPtr ppn)
+			bool insert(IntPtr vpn, IntPtr ppn, size_t *kicks_out = nullptr)
 			{
 
 				m_stats.insertions++;
+				if (kicks_out)
+					*kicks_out = 0;
 
 				for (size_t b = 0; b < NUM_BANKS; b++)
 				{
@@ -156,15 +159,53 @@ namespace ParametricDramDirectoryMSI
 					}
 				}
 
-				size_t evict_bank = m_evict_counter % NUM_BANKS;
+				IntPtr curr_vpn = vpn;
+				IntPtr curr_ppn = ppn;
+				size_t curr_bank = m_evict_counter % NUM_BANKS;
 				m_evict_counter++;
-				size_t evict_idx = getIndex(evict_bank, vpn);
 
-				Entry &victim = m_banks[evict_bank][evict_idx];
-				victim.valid = true;
-				victim.vpn = vpn;
-				victim.ppn = ppn;
+				size_t total_kicks = 0;
+				for (size_t kick = 0; kick < MAX_KICKS; kick++)
+				{
+					total_kicks++;
+					m_stats.kicks++;
+
+					size_t idx = getIndex(curr_bank, curr_vpn);
+					Entry &slot = m_banks[curr_bank][idx];
+
+					IntPtr displaced_vpn = slot.vpn;
+					IntPtr displaced_ppn = slot.ppn;
+					slot.vpn = curr_vpn;
+					slot.ppn = curr_ppn;
+					slot.valid = true;
+
+					curr_vpn = displaced_vpn;
+					curr_ppn = displaced_ppn;
+
+					for (size_t i = 1; i < NUM_BANKS; i++)
+					{
+						size_t alt_bank = (curr_bank + i) % NUM_BANKS;
+						size_t alt_idx = getIndex(alt_bank, curr_vpn);
+						Entry &alt_slot = m_banks[alt_bank][alt_idx];
+
+						if (!alt_slot.valid)
+						{
+							alt_slot.valid = true;
+							alt_slot.vpn = curr_vpn;
+							alt_slot.ppn = curr_ppn;
+							if (kicks_out)
+								*kicks_out = total_kicks;
+							return false;
+						}
+					}
+
+					curr_bank = (curr_bank + 1) % NUM_BANKS;
+				}
+
 				m_stats.evictions++;
+				if (kicks_out)
+					*kicks_out = total_kicks;
+				return true;
 
 				return true;
 			}
@@ -195,6 +236,7 @@ namespace ParametricDramDirectoryMSI
 			UInt64 nest_hits;
 			UInt64 nest_misses;
 			UInt64 nest_insertions;
+			UInt64 nest_kicks;
 			UInt64 nest_evictions;
 			
 			SubsecondTime total_walk_latency;
