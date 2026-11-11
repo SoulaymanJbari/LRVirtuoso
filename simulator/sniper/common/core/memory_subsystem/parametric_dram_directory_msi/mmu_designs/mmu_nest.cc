@@ -135,7 +135,17 @@ namespace ParametricDramDirectoryMSI
 		if (m_nest_tables)
 		{
 			for (int i = 0; i < m_num_page_sizes; i++)
+			{
+				const NestCuckooTable::Stats &st = m_nest_tables[i]->getStats();
+				std::cout << "\n================ NEST STATS (Page size " << m_nest_tables[i]->getPageSize() << ") ================\n"
+				          << "  Lookups    : " << st.lookups << "\n"
+				          << "  Hits       : " << st.hits << " (" << (st.lookups ? (100.0 * st.hits / st.lookups) : 0.0) << "%)\n"
+				          << "  Misses     : " << st.misses << "\n"
+				          << "  Insertions : " << st.insertions << "\n"
+				          << "  Evictions  : " << st.evictions << "\n"
+				          << "=========================================================\n" << std::endl;
 				delete m_nest_tables[i];
+			}
 			delete[] m_nest_tables;
 		}
 		delete[] m_pom_tlb;
@@ -555,27 +565,6 @@ namespace ParametricDramDirectoryMSI
 			if (count)
 				translation_stats.total_translation_latency += final_software_tlb_latency;
 			
-			if (!software_tlb_hit)
-			{
-				int app_id = core->getThread()->getAppId();
-				PageTable* page_table = Sim()->getMimicOS()->getPageTable(app_id);
-				PTWOutcome ptw_result = performPTW(address, false /* modeled */, false /* count */, 
-				                                   false, eip, lock, page_table, false, instruction);
-				ppn_result = ptw_result.ppn;
-				page_size_result = ptw_result.page_size;
-				for (int i = 0; i < m_num_page_sizes; i++)
-				{
-					if (m_nest_tables[i]->getPageSize() == page_size_result)
-					{
-						IntPtr vpn = address >> page_size_result;
-						m_nest_tables[i]->insert(vpn, ppn_result);
-						mmu_pomtlb_log->debug("[MMU:NEST] Miss resolved by oracle, inserted VPN=%lx -> PPN=%lx in L3", vpn, ppn_result);
-						break;
-					}
-				}
-				software_tlb_hit = true;
-			}
-
 		}
 
 		/*
@@ -769,13 +758,14 @@ mmu_pomtlb_log->debug("[MMU] Total Walk Latency: %lu", total_walk_latency.getNS(
 		 */
 		if (!software_tlb_hit && !tlb_hit)
 		{
-			for (int page_size = 0; page_size < number_of_page_sizes; page_size++)
+			for (int i = 0; i < m_num_page_sizes; i++)
 			{
-				TLB* pom = m_pom_tlb[page_size];
-				if (pom->supportsPageSize(page_size_result) && pom->getAllocateOnMiss())
+				if (m_nest_tables[i]->getPageSize() == page_size_result)
 				{
-					mmu_pomtlb_log->debug("[MMU] Allocating in Software TLB: Page Size = %d with VPN: %lx with PPN: %lx", page_size_list[page_size], (address >> page_size_result), ppn_result);
-					pom->allocate(address, time, count, lock, page_size_result, ppn_result);
+					IntPtr vpn = address >> page_size_result;
+					m_nest_tables[i]->insert(vpn, ppn_result);
+					mmu_pomtlb_log->debug("[MMU:NEST] Inserted VPN=%lx -> PPN=%lx in L3 table after PTW", vpn, ppn_result);
+					break;
 				}
 			}
 		}
