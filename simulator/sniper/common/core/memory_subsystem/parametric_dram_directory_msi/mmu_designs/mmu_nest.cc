@@ -302,6 +302,11 @@ namespace ParametricDramDirectoryMSI
 		registerStatsMetric(name, core->getId(), "total_translation_latency", &translation_stats.total_translation_latency);
 		registerStatsMetric(name, core->getId(), "total_software_tlb_latency", &translation_stats.software_tlb_latency);
 		registerStatsMetric(name, core->getId(), "total_walk_delay_latency", &translation_stats.total_walk_delay_latency);
+		registerStatsMetric(name, core->getId(), "nest_lookups", &translation_stats.nest_lookups);
+		registerStatsMetric(name, core->getId(), "nest_hits", &translation_stats.nest_hits);
+		registerStatsMetric(name, core->getId(), "nest_misses", &translation_stats.nest_misses);
+		registerStatsMetric(name, core->getId(), "nest_insertions", &translation_stats.nest_insertions);
+		registerStatsMetric(name, core->getId(), "nest_evictions", &translation_stats.nest_evictions);
 
 		// Per-level TLB latency statistics
 		translation_stats.tlb_latency_per_level = new SubsecondTime[tlb_subsystem->getTLBSubsystem().size()];
@@ -538,6 +543,9 @@ namespace ParametricDramDirectoryMSI
 
 		if (!tlb_hit)
 		{
+			if (count)
+				translation_stats.nest_lookups++;
+
 			for (int i = 0; i < m_num_page_sizes; i++)
 			{
 				int ps = m_nest_tables[i]->getPageSize();
@@ -549,10 +557,14 @@ namespace ParametricDramDirectoryMSI
 					software_tlb_hit = true;
 					ppn_result = ppn_found;
 					page_size_result = ps;
-					mmu_pomtlb_log->debug("[MMU:NEST] Hit in L3 table for page size %d: VPN=%lx -> PPN=%lx", ps, vpn, ppn_result);
+					if (count)
+						translation_stats.nest_hits++;
 					break;
 				}
 			}
+
+			if (!software_tlb_hit && count)
+				translation_stats.nest_misses++;
 
 			final_software_tlb_latency = SubsecondTime::NS(10);
 
@@ -763,7 +775,13 @@ mmu_pomtlb_log->debug("[MMU] Total Walk Latency: %lu", total_walk_latency.getNS(
 				if (m_nest_tables[i]->getPageSize() == page_size_result)
 				{
 					IntPtr vpn = address >> page_size_result;
-					m_nest_tables[i]->insert(vpn, ppn_result);
+					bool evicted = m_nest_tables[i]->insert(vpn, ppn_result);
+					if (count)
+					{
+						translation_stats.nest_insertions++;
+						if (evicted)
+							translation_stats.nest_evictions++;
+					}
 					mmu_pomtlb_log->debug("[MMU:NEST] Inserted VPN=%lx -> PPN=%lx in L3 table after PTW", vpn, ppn_result);
 					break;
 				}

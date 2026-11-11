@@ -124,7 +124,7 @@ namespace ParametricDramDirectoryMSI
 				return false;
 			}
 
-			void insert(IntPtr vpn, IntPtr ppn)
+			bool insert(IntPtr vpn, IntPtr ppn)
 			{
 
 				m_stats.insertions++;
@@ -136,7 +136,7 @@ namespace ParametricDramDirectoryMSI
 					if (e.valid && e.vpn == vpn)
 					{
 						e.ppn = ppn;
-						return;
+						return false;
 					}
 				}
 
@@ -149,7 +149,7 @@ namespace ParametricDramDirectoryMSI
 						e.valid = true;
 						e.vpn = vpn;
 						e.ppn = ppn;
-						return;
+						return false;
 					}
 				}
 
@@ -162,6 +162,8 @@ namespace ParametricDramDirectoryMSI
 				victim.vpn = vpn;
 				victim.ppn = ppn;
 				m_stats.evictions++;
+
+				return true;
 			}
 			void resetStats() { m_stats = Stats{0, 0, 0, 0, 0}; }
     		const Stats& getStats() const { return m_stats; }
@@ -195,6 +197,12 @@ namespace ParametricDramDirectoryMSI
 
 			UInt64 page_faults;
 			UInt64 page_table_walks;
+
+			UInt64 nest_lookups;
+			UInt64 nest_hits;
+			UInt64 nest_misses;
+			UInt64 nest_insertions;
+			UInt64 nest_evictions;
 			
 			SubsecondTime total_walk_latency;
 			SubsecondTime total_walk_delay_latency;
