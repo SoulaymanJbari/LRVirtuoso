@@ -12,6 +12,7 @@
 #include "mmu_utopia.h"
 #include "mmu_utopia_coalesce.h"
 #include "mmu_victima.h"
+#include "mmu_nest.h"
 #include "config.hpp"
 
 
@@ -31,6 +32,10 @@ namespace ParametricDramDirectoryMSI
 			{
 				return new MemoryManagementUnitPOMTLB(core, memory_manager, shmem_perf_model, name, nested_mmu);
 			}
+			else if (type == "nest") // NEST: Cuckoo RLDRAM L3 TLB
+            {
+                return new MemoryManagementUnitNEST(core, memory_manager, shmem_perf_model, name, nested_mmu);
+            }
 			else if (type == "range") // Karakostas et al. ISCA 2015
 			{
 				return new RangeMMU(core, memory_manager, shmem_perf_model, name, nested_mmu);
