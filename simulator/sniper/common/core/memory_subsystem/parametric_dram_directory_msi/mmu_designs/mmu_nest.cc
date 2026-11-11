@@ -104,6 +104,9 @@ namespace ParametricDramDirectoryMSI
 	                                                       String _name, 
 	                                                       MemoryManagementUnitBase *_nested_mmu)
 	: MemoryManagementUnitBase(_core, _memory_manager, _shmem_perf_model, _name, _nested_mmu),
+	  memory_manager(_memory_manager),
+	  m_nest_tables(nullptr),
+	  m_num_page_sizes(0),
 	  m_pom_tlb(nullptr),
 	  software_tlb_base_register(nullptr),
 	  m_size(nullptr),
@@ -129,6 +132,12 @@ namespace ParametricDramDirectoryMSI
 		delete pt_walkers;
 		delete[] translation_stats.tlb_latency_per_level;
 		delete[] translation_stats.tlb_hit_page_sizes;
+		if (m_nest_tables)
+		{
+			for (int i = 0; i < m_num_page_sizes; i++)
+				delete m_nest_tables[i];
+			delete[] m_nest_tables;
+		}
 		delete[] m_pom_tlb;
 		delete[] software_tlb_base_register;
 		delete[] m_size;
@@ -238,6 +247,21 @@ namespace ParametricDramDirectoryMSI
 			                       1,  // #page sizes in this TLB
 			                       type,
 			                       allocate_on_miss);
+		}
+
+		m_num_page_sizes = Sim()->getCfg()->getInt("perf_model/nest/page_sizes");
+		m_nest_tables = new NestCuckooTable*[m_num_page_sizes];
+
+		for (int i = 0; i < m_num_page_sizes; i++)
+		{
+			int page_size = Sim()->getCfg()->getIntArray("perf_model/nest/page_size_list", i);
+			int entries   = Sim()->getCfg()->getIntArray("perf_model/nest/entries", i);
+
+			std::cout << "[MMU:NEST] Instantiating Cuckoo Table for page size: " 
+			          << page_size << " with " << entries << " total entries (" 
+			          << (entries / 4) << " entries/bank)" << std::endl;
+
+			m_nest_tables[i] = new NestCuckooTable(page_size, entries);
 		}
 	}
 
@@ -504,111 +528,54 @@ namespace ParametricDramDirectoryMSI
 
 		if (!tlb_hit)
 		{
+			for (int i = 0; i < m_num_page_sizes; i++)
+			{
+				int ps = m_nest_tables[i]->getPageSize();
+				IntPtr vpn = address >> ps;
+				IntPtr ppn_found = 0;
+
+				if (m_nest_tables[i]->lookup(vpn, ppn_found))
+				{
+					software_tlb_hit = true;
+					ppn_result = ppn_found;
+					page_size_result = ps;
+					mmu_pomtlb_log->debug("[MMU:NEST] Hit in L3 table for page size %d: VPN=%lx -> PPN=%lx", ps, vpn, ppn_result);
+					break;
+				}
+			}
+
 			final_software_tlb_latency = SubsecondTime::NS(10);
-			software_tlb_hit = true;
-
-			// Résolution fonctionnelle instantanée pour récupérer PPN et taille de page (0 cycle)
-			int app_id = core->getThread()->getAppId();
-			PageTable* page_table = Sim()->getMimicOS()->getPageTable(app_id);
-			PTWOutcome ptw_result = performPTW(address, false /* modeled */, false /* count */, 
-			                                   false, eip, lock, page_table, false, instruction);
-
-			ppn_result = ptw_result.ppn;
-			page_size_result = ptw_result.page_size;
 
 			if (count)
 				translation_stats.software_tlb_latency += final_software_tlb_latency;
 
-			// Avancer l'horloge du thread utilisateur de 10 ns
 			shmem_perf_model->setElapsedTime(ShmemPerfModel::_USER_THREAD,
 				time_before_software_tlb + final_software_tlb_latency);
 
 			if (count)
 				translation_stats.total_translation_latency += final_software_tlb_latency;
-
-			mmu_pomtlb_log->debug("[MMU:NEST-IDEAL] Oracle Hit @ 10ns - Addr: %lx -> PPN: %lx (Page size: %d)",
-			                      address, ppn_result, page_size_result);
-
-			/*mmu_pomtlb_log->debug("[MMU] TLB Miss, checking software TLB");
-			for (int page_size = 0; page_size < number_of_page_sizes; page_size++)
-			{
-				mmu_pomtlb_log->debug("[MMU] Searching software TLB for page size: %d", page_size_list[page_size]);
-				TLB* pom = m_pom_tlb[page_size];
-				software_tlb_block_info = pom->lookup(address, time, count, lock, eip, modeled, count, NULL);
-
-				mmu_pomtlb_log->debug("[MMU] Software TLB Hit ? %d at TLB: %s", (software_tlb_block_info != NULL), pom->getName().c_str());
-
-				// Simulate the memory access that the software TLB structure does
-				translationPacket packet;
-				packet.eip          = eip;
-				packet.instruction  = false;
-				packet.lock_signal  = lock;
-				packet.modeled      = modeled;
-				packet.count        = count;
-				// Software TLB metadata access
-				packet.type         = CacheBlockInfo::block_type_t::PAGE_TABLE_DATA;
-
-				IntPtr tag;
-				UInt32 set_index;
-				pom->getCache().splitAddressTLB(address, tag, set_index, page_size_list[page_size]);
-
-				mmu_pomtlb_log->debug("[MMU] Software TLB Lookup: %lx at page size: %d with tag: %lx and set index: %u and base address: %lx",
-					address, page_size_list[page_size], tag, set_index, software_tlb_base_register[page_size]*4096);
-				packet.address = software_tlb_base_register[page_size]*4096
-				                 + pom->getAssoc()* pom->getEntrySize() * set_index;
-
-				mmu_pomtlb_log->debug("[MMU] Software TLB Address: %lx", packet.address);
-
-                    HitWhere::where_t sw_hit_where = HitWhere::UNKNOWN;
-                    software_tlb_latency[page_size] = accessCache(packet, time_before_software_tlb, false, sw_hit_where);
-
-				mmu_pomtlb_log->debug("[MMU] Software TLB Latency: %lu at page size: %d", software_tlb_latency[page_size].getNS(), page_size_list[page_size]);
-
-				if (software_tlb_block_info != NULL)
-				{
-					// We have a software TLB hit
-					final_software_tlb_latency = software_tlb_latency[page_size];
-					software_tlb_hit = true;
-					ppn_result = software_tlb_block_info->getPPN();
-					page_size_result = software_tlb_block_info->getPageSize();
-					mmu_pomtlb_log->debug("[MMU] Software TLB Hit at page size: %d", page_size_result);
-					mmu_pomtlb_log->debug("[MMU] Software TLB Hit PPN: %lx", ppn_result);
-					mmu_pomtlb_log->debug("[MMU] Software TLB Hit VPN: %lx", (address >> page_size_result));
-					mmu_pomtlb_log->debug("[MMU] Software TLB Hit Tag: %lx", tag);
-					mmu_pomtlb_log->debug("[MMU] Software TLB Hit Latency: %lu", final_software_tlb_latency.getNS());
-				}
-			}
-
+			
 			if (!software_tlb_hit)
 			{
-				// If all software TLBs missed, we take the max of the latencies
-				mmu_pomtlb_log->debug("[MMU] Software TLB Miss");
-				SubsecondTime max_software_tlb_latency = SubsecondTime::Zero();
-				for (int page_size = 0; page_size < number_of_page_sizes; page_size++)
+				int app_id = core->getThread()->getAppId();
+				PageTable* page_table = Sim()->getMimicOS()->getPageTable(app_id);
+				PTWOutcome ptw_result = performPTW(address, false /* modeled */, false /* count */, 
+				                                   false, eip, lock, page_table, false, instruction);
+				ppn_result = ptw_result.ppn;
+				page_size_result = ptw_result.page_size;
+				for (int i = 0; i < m_num_page_sizes; i++)
 				{
-					max_software_tlb_latency = max(max_software_tlb_latency, software_tlb_latency[page_size]);
+					if (m_nest_tables[i]->getPageSize() == page_size_result)
+					{
+						IntPtr vpn = address >> page_size_result;
+						m_nest_tables[i]->insert(vpn, ppn_result);
+						mmu_pomtlb_log->debug("[MMU:NEST] Miss resolved by oracle, inserted VPN=%lx -> PPN=%lx in L3", vpn, ppn_result);
+						break;
+					}
 				}
-				final_software_tlb_latency = max_software_tlb_latency;
-
-				if (count)
-					translation_stats.software_tlb_latency += final_software_tlb_latency;
-			}
-			else
-			{
-				// If we had a software TLB hit, accumulate the latency
-				if (count)
-					translation_stats.software_tlb_latency += final_software_tlb_latency;
+				software_tlb_hit = true;
 			}
 
-			mmu_pomtlb_log->debug("[MMU] Final Software TLB Latency: %lu", final_software_tlb_latency.getNS());
-
-			// Advance the clock by the final software TLB latency
-			shmem_perf_model->setElapsedTime(ShmemPerfModel::_USER_THREAD,
-				time_before_software_tlb + final_software_tlb_latency);
-			if (count)
-				translation_stats.total_translation_latency += final_software_tlb_latency;
-
-			mmu_pomtlb_log->debug("[MMU] New time after charging Software TLB latency: %lu", shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS());*/
 		}
 
 		/*

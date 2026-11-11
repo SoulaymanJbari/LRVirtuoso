@@ -14,9 +14,158 @@
 #include "sim_log.h"
 #include "debug_config.h"
 
+#include <vector>
+#include <cstdint>
+#include <cstddef>
+
 namespace ParametricDramDirectoryMSI
 {
 	class TLBHierarchy;
+
+	class NestCuckooTable
+	{
+		public:
+			static constexpr size_t NUM_BANKS = 4;
+			struct Entry
+			{
+				bool valid;
+				IntPtr vpn;
+				IntPtr ppn;
+
+				Entry() : valid(false), vpn(0), ppn(0) {}
+			};
+
+			struct Stats
+			{
+				UInt64 lookups;
+				UInt64 hits;
+				UInt64 misses;
+				UInt64 insertions;
+				UInt64 evictions;
+			};
+		private:
+			int m_page_size;
+			size_t m_total_entries;
+			size_t m_entries_per_bank;
+			std::vector<Entry> m_banks[NUM_BANKS];
+			uint8_t m_evict_counter;
+			Stats m_stats;
+
+			size_t hash0(IntPtr vpn) const
+			{
+				uint64_t x = static_cast<uint64_t>(vpn);
+				x ^= (x >> 16);
+				return static_cast<size_t>(x % m_entries_per_bank);
+			}
+
+			size_t hash1(IntPtr vpn) const
+			{
+				uint64_t x = static_cast<uint64_t>(vpn) * 0x9e3779b97f4a7c15ULL;
+				x ^= (x >> 21);
+				return static_cast<size_t>(x % m_entries_per_bank);
+			}
+
+			size_t hash2(IntPtr vpn) const
+			{
+				uint64_t x = static_cast<uint64_t>(vpn) * 0xbf58476d1ce4e5b9ULL;
+				x ^= (x >> 27);
+				return static_cast<size_t>(x % m_entries_per_bank);
+			}
+
+			size_t hash3(IntPtr vpn) const
+			{
+				uint64_t x = static_cast<uint64_t>(vpn);
+				x = (x << 13) | (x >> 51);
+				x ^= 0x94d049bb133111ebULL;
+				return static_cast<size_t>(x % m_entries_per_bank);
+			}
+
+			size_t getIndex(size_t bank, IntPtr vpn) const
+			{
+				switch (bank)
+				{
+					case 0: return hash0(vpn);
+					case 1: return hash1(vpn);
+					case 2: return hash2(vpn);
+					case 3: return hash3(vpn);
+					default: return 0;
+				}
+			}
+		
+		public:
+			NestCuckooTable(int page_size, size_t total_entries)
+			: m_page_size(page_size),
+			  m_total_entries(total_entries),
+			  m_entries_per_bank(total_entries / NUM_BANKS),
+			  m_evict_counter(0)
+			{
+				for (size_t b = 0; b < NUM_BANKS; b++)
+					m_banks[b].resize(m_entries_per_bank);
+				resetStats();
+			}
+
+			int getPageSize() const { return m_page_size; }
+
+			bool lookup(IntPtr vpn, IntPtr &out_ppn)
+			{
+				m_stats.lookups++;
+				for (size_t b = 0; b < NUM_BANKS; b++)
+				{
+					size_t idx = getIndex(b, vpn);
+					const Entry &e = m_banks[b][idx];
+					if (e.valid && e.vpn == vpn)
+					{
+						out_ppn = e.ppn;
+						m_stats.hits++;
+						return true;
+					}
+				}
+				m_stats.misses++;
+				return false;
+			}
+
+			void insert(IntPtr vpn, IntPtr ppn)
+			{
+
+				m_stats.insertions++;
+
+				for (size_t b = 0; b < NUM_BANKS; b++)
+				{
+					size_t idx = getIndex(b, vpn);
+					Entry &e = m_banks[b][idx];
+					if (e.valid && e.vpn == vpn)
+					{
+						e.ppn = ppn;
+						return;
+					}
+				}
+
+				for (size_t b = 0; b < NUM_BANKS; b++)
+				{
+					size_t idx = getIndex(b, vpn);
+					Entry &e = m_banks[b][idx];
+					if (!e.valid)
+					{
+						e.valid = true;
+						e.vpn = vpn;
+						e.ppn = ppn;
+						return;
+					}
+				}
+
+				size_t evict_bank = m_evict_counter % NUM_BANKS;
+				m_evict_counter++;
+				size_t evict_idx = getIndex(evict_bank, vpn);
+
+				Entry &victim = m_banks[evict_bank][evict_idx];
+				victim.valid = true;
+				victim.vpn = vpn;
+				victim.ppn = ppn;
+				m_stats.evictions++;
+			}
+			void resetStats() { m_stats = Stats{0, 0, 0, 0, 0}; }
+    		const Stats& getStats() const { return m_stats; }
+	};
 
 	class MemoryManagementUnitNEST : public MemoryManagementUnitBase
 	{
@@ -28,17 +177,16 @@ namespace ParametricDramDirectoryMSI
 		MSHR *pt_walkers; 
 		BaseFilter *ptw_filter;
 
+		NestCuckooTable **m_nest_tables;
+		int m_num_page_sizes;
+
 
 		TLB **m_pom_tlb;
 		int pom_tlb_entry_size;
 		IntPtr *software_tlb_base_register;
-
 		UInt32 *m_size;
 		UInt32 *m_associativity;
 
-
-		
-		//For the log
 		SimLog *mmu_pomtlb_log;
 
 		struct
