@@ -504,7 +504,32 @@ namespace ParametricDramDirectoryMSI
 
 		if (!tlb_hit)
 		{
-			mmu_pomtlb_log->debug("[MMU] TLB Miss, checking software TLB");
+			final_software_tlb_latency = SubsecondTime::NS(10);
+			software_tlb_hit = true;
+
+			// Résolution fonctionnelle instantanée pour récupérer PPN et taille de page (0 cycle)
+			int app_id = core->getThread()->getAppId();
+			PageTable* page_table = Sim()->getMimicOS()->getPageTable(app_id);
+			PTWOutcome ptw_result = performPTW(address, false /* modeled */, false /* count */, 
+			                                   false, eip, lock, page_table, false, instruction);
+
+			ppn_result = ptw_result.ppn;
+			page_size_result = ptw_result.page_size;
+
+			if (count)
+				translation_stats.software_tlb_latency += final_software_tlb_latency;
+
+			// Avancer l'horloge du thread utilisateur de 10 ns
+			shmem_perf_model->setElapsedTime(ShmemPerfModel::_USER_THREAD,
+				time_before_software_tlb + final_software_tlb_latency);
+
+			if (count)
+				translation_stats.total_translation_latency += final_software_tlb_latency;
+
+			mmu_pomtlb_log->debug("[MMU:NEST-IDEAL] Oracle Hit @ 10ns - Addr: %lx -> PPN: %lx (Page size: %d)",
+			                      address, ppn_result, page_size_result);
+
+			/*mmu_pomtlb_log->debug("[MMU] TLB Miss, checking software TLB");
 			for (int page_size = 0; page_size < number_of_page_sizes; page_size++)
 			{
 				mmu_pomtlb_log->debug("[MMU] Searching software TLB for page size: %d", page_size_list[page_size]);
@@ -583,7 +608,7 @@ namespace ParametricDramDirectoryMSI
 			if (count)
 				translation_stats.total_translation_latency += final_software_tlb_latency;
 
-			mmu_pomtlb_log->debug("[MMU] New time after charging Software TLB latency: %lu", shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS());
+			mmu_pomtlb_log->debug("[MMU] New time after charging Software TLB latency: %lu", shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS());*/
 		}
 
 		/*
