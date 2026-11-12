@@ -5,7 +5,7 @@ exp_*/
 
 # Trace lists: distributed with the trace bundle, not the source repo
 # (each .tlist's first line is the reviewer's absolute trace-root path).
-vm_tlist/
+#vm_tlist/
 
 # AE harness: generated result tables + local trace manifests.
 ae/ae_out/

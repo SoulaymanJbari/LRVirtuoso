@@ -1,0 +1,21 @@
+trace_suite:
+  rnd:
+    tracelist_base_path: vm_tlist/
+    tracelists:
+      - nest_rnd.tlist
+
+configs:
+  configs_base_path: ../simulator/sniper/config/address_translation_schemes/
+  nest-test:
+    name: nest-test
+    file: reservethp_nest.cfg
+    extends:
+      - --perf_model/nest/mode=ideal
+    description: NEST ideal, pipeline test
+
+experiment_suites:
+  nest-test:
+    description: Pipeline test - NEST ideal on rnd, 10M instructions
+    configs: [nest-test]
+    trace_suite: rnd
+    instruction_count: 10000000
