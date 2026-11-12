@@ -17,6 +17,10 @@
 #include <vector>
 #include <cstdint>
 #include <cstddef>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
+#include <cstdio>
 
 namespace ParametricDramDirectoryMSI
 {
@@ -26,15 +30,15 @@ namespace ParametricDramDirectoryMSI
 	{
 		public:
 			static constexpr size_t NUM_BANKS = 4;
-			static constexpr size_t MAX_KICKS = 8;
 
 			struct Entry
 			{
 				bool valid;
+				UInt16 asid;
 				IntPtr vpn;
 				IntPtr ppn;
 
-				Entry() : valid(false), vpn(0), ppn(0) {}
+				Entry() : valid(false), asid(0), vpn(0), ppn(0) {}
 			};
 
 			struct Stats
@@ -50,6 +54,7 @@ namespace ParametricDramDirectoryMSI
 			int m_page_size;
 			size_t m_total_entries;
 			size_t m_entries_per_bank;
+			size_t m_max_kicks;
 			std::vector<Entry> m_banks[NUM_BANKS];
 			uint8_t m_evict_counter;
 			Stats m_stats;
@@ -61,43 +66,25 @@ namespace ParametricDramDirectoryMSI
 				return z ^ (z >> 31);
 			}
 
-			size_t hash0(IntPtr vpn) const
+			static inline uint64_t makeKey(UInt16 asid, IntPtr vpn)
 			{
-				return static_cast<size_t>(mix64(static_cast<uint64_t>(vpn) ^ 0x517cc1b727220a95ULL) % m_entries_per_bank);
+				return static_cast<uint64_t>(vpn) ^ (static_cast<uint64_t>(asid) << 48);
 			}
 
-			size_t hash1(IntPtr vpn) const
+			size_t getIndex(size_t bank, uint64_t key) const
 			{
-				return static_cast<size_t>(mix64(static_cast<uint64_t>(vpn) ^ 0x9e3779b97f4a7c15ULL) % m_entries_per_bank);
-			}
-
-			size_t hash2(IntPtr vpn) const
-			{
-				return static_cast<size_t>(mix64(static_cast<uint64_t>(vpn) ^ 0xbf58476d1ce4e5b9ULL) % m_entries_per_bank);
-			}
-
-			size_t hash3(IntPtr vpn) const
-			{
-				return static_cast<size_t>(mix64(static_cast<uint64_t>(vpn) ^ 0x3141592653589793ULL) % m_entries_per_bank);
-			}
-
-			size_t getIndex(size_t bank, IntPtr vpn) const
-			{
-				switch (bank)
-				{
-					case 0: return hash0(vpn);
-					case 1: return hash1(vpn);
-					case 2: return hash2(vpn);
-					case 3: return hash3(vpn);
-					default: return 0;
-				}
+				static const uint64_t seeds[NUM_BANKS] = {
+					0x517cc1b727220a95ULL, 0x9e3779b97f4a7c15ULL,
+					0xbf58476d1ce4e5b9ULL, 0x3141592653589793ULL };
+				return static_cast<size_t>(mix64(key ^ seeds[bank]) % m_entries_per_bank);
 			}
 		
 		public:
-			NestCuckooTable(int page_size, size_t total_entries)
+			NestCuckooTable(int page_size, size_t total_entries, size_t max_kicks)
 			: m_page_size(page_size),
 			  m_total_entries(total_entries),
 			  m_entries_per_bank(total_entries / NUM_BANKS),
+			  m_max_kicks(max_kicks),
 			  m_evict_counter(0)
 			{
 				for (size_t b = 0; b < NUM_BANKS; b++)
@@ -106,18 +93,17 @@ namespace ParametricDramDirectoryMSI
 			}
 
 			int getPageSize() const { return m_page_size; }
-			Stats* getStatsPtr() { return &m_stats; }
     		const Stats& getStats() const { return m_stats; }
-			void resetStats() { m_stats = Stats{0, 0, 0, 0, 0}; }
+			void resetStats() { m_stats = Stats{0, 0, 0, 0, 0, 0}; }
 
-			bool lookup(IntPtr vpn, IntPtr &out_ppn)
+			bool lookup(UInt16 asid, IntPtr vpn, IntPtr &out_ppn)
 			{
 				m_stats.lookups++;
+				uint64_t key = makeKey(asid, vpn);
 				for (size_t b = 0; b < NUM_BANKS; b++)
 				{
-					size_t idx = getIndex(b, vpn);
-					const Entry &e = m_banks[b][idx];
-					if (e.valid && e.vpn == vpn)
+					const Entry &e = m_banks[b][getIndex(b, key)];
+					if (e.valid && e.asid == asid && e.vpn == vpn)
 					{
 						out_ppn = e.ppn;
 						m_stats.hits++;
@@ -128,18 +114,19 @@ namespace ParametricDramDirectoryMSI
 				return false;
 			}
 
-			bool insert(IntPtr vpn, IntPtr ppn, size_t *kicks_out = nullptr)
+			bool insert(UInt16 asid, IntPtr vpn, IntPtr ppn, size_t *kicks_out = nullptr)
 			{
 
 				m_stats.insertions++;
 				if (kicks_out)
 					*kicks_out = 0;
 
+				uint64_t key = makeKey(asid, vpn);
+
 				for (size_t b = 0; b < NUM_BANKS; b++)
 				{
-					size_t idx = getIndex(b, vpn);
-					Entry &e = m_banks[b][idx];
-					if (e.valid && e.vpn == vpn)
+					Entry &e = m_banks[b][getIndex(b, key)];
+					if (e.valid && e.asid == asid && e.vpn == vpn)
 					{
 						e.ppn = ppn;
 						return false;
@@ -148,51 +135,46 @@ namespace ParametricDramDirectoryMSI
 
 				for (size_t b = 0; b < NUM_BANKS; b++)
 				{
-					size_t idx = getIndex(b, vpn);
-					Entry &e = m_banks[b][idx];
+					Entry &e = m_banks[b][getIndex(b, key)];
 					if (!e.valid)
 					{
 						e.valid = true;
+						e.asid = asid;
 						e.vpn = vpn;
 						e.ppn = ppn;
 						return false;
 					}
 				}
 
+				UInt16 curr_asid = asid;
 				IntPtr curr_vpn = vpn;
 				IntPtr curr_ppn = ppn;
 				size_t curr_bank = m_evict_counter % NUM_BANKS;
 				m_evict_counter++;
 
 				size_t total_kicks = 0;
-				for (size_t kick = 0; kick < MAX_KICKS; kick++)
+				for (size_t kick = 0; kick < m_max_kicks; kick++)
 				{
 					total_kicks++;
 					m_stats.kicks++;
 
-					size_t idx = getIndex(curr_bank, curr_vpn);
-					Entry &slot = m_banks[curr_bank][idx];
-
-					IntPtr displaced_vpn = slot.vpn;
-					IntPtr displaced_ppn = slot.ppn;
-					slot.vpn = curr_vpn;
-					slot.ppn = curr_ppn;
+					Entry &slot = m_banks[curr_bank][getIndex(curr_bank, makeKey(curr_asid, curr_vpn))];
+					std::swap(slot.asid, curr_asid);
+					std::swap(slot.vpn,  curr_vpn);
+					std::swap(slot.ppn,  curr_ppn);
 					slot.valid = true;
 
-					curr_vpn = displaced_vpn;
-					curr_ppn = displaced_ppn;
-
+					uint64_t curr_key = makeKey(curr_asid, curr_vpn);
 					for (size_t i = 1; i < NUM_BANKS; i++)
 					{
 						size_t alt_bank = (curr_bank + i) % NUM_BANKS;
-						size_t alt_idx = getIndex(alt_bank, curr_vpn);
-						Entry &alt_slot = m_banks[alt_bank][alt_idx];
-
-						if (!alt_slot.valid)
+						Entry &alt = m_banks[alt_bank][getIndex(alt_bank, curr_key)];
+						if (!alt.valid)
 						{
-							alt_slot.valid = true;
-							alt_slot.vpn = curr_vpn;
-							alt_slot.ppn = curr_ppn;
+							alt.valid = true;
+							alt.asid = curr_asid;
+							alt.vpn = curr_vpn;
+							alt.ppn = curr_ppn;
 							if (kicks_out)
 								*kicks_out = total_kicks;
 							return false;
@@ -206,9 +188,51 @@ namespace ParametricDramDirectoryMSI
 				if (kicks_out)
 					*kicks_out = total_kicks;
 				return true;
-
-				return true;
 			}
+	};
+
+	class NestShared
+	{
+		public:
+			enum class Mode { Off, Cuckoo, Ideal};
+
+			static NestShared* get();
+
+			Mode getMode() const {return m_mode; }
+			bool isEnabled() const { return m_mode != Mode::Off;}
+			SubsecondTime getLatency() const { return m_latency; }
+
+			bool lookup(UInt16 asid, IntPtr address, IntPtr &ppn, int &page_size);
+			void insert(UInt16 asid, IntPtr address, IntPtr ppn, int page_size,
+						size_t &kicks, bool &evicted);
+		
+		private:
+			NestShared();
+			
+			static uint64_t idealKey(UInt16 asid, IntPtr vpn)
+			{
+				return static_cast<uint64_t>(vpn) | (static_cast<uint64_t>(asid) << 48);
+			}
+
+			static NestShared *s_instance;
+			static std::mutex s_init_lock;
+
+			Mode m_mode;
+			SubsecondTime m_latency;
+			int m_num_page_sizes;
+			std::vector<int> m_page_sizes;
+			std::vector<NestCuckooTable*> m_tables;                       // mode Cuckoo
+			std::vector<std::unordered_map<uint64_t, IntPtr>> m_ideal;    // mode Ideal
+			std::mutex m_lock;
+	};
+
+	struct NestTraceRecord
+	{
+		UInt64 time_ns;
+		UInt64 vpn4k;      // address >> 12
+		UInt16 asid;
+		UInt8  page_size;  // 12 ou 21
+		UInt8  flags;      // bit0 : hit NEST, bit1 : défaut de page
 	};
 
 	class MemoryManagementUnitNEST : public MemoryManagementUnitBase
@@ -221,8 +245,8 @@ namespace ParametricDramDirectoryMSI
 		MSHR *pt_walkers; 
 		BaseFilter *ptw_filter;
 
-		NestCuckooTable **m_nest_tables;
-		int m_num_page_sizes;
+		NestShared *m_nest;
+		FILE *m_trace_file;
 
 		SimLog *mmu_nest_log;
 
@@ -249,6 +273,8 @@ namespace ParametricDramDirectoryMSI
 			SubsecondTime walker_is_active;
 			SubsecondTime *tlb_latency_per_level;
 			UInt64 *tlb_hit_page_sizes; 
+
+			UInt64 translations_with_fault;
 
 		} translation_stats;
 

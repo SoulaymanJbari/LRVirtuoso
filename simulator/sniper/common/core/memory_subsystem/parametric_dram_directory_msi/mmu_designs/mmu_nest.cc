@@ -48,6 +48,97 @@ using namespace std;
 
 namespace ParametricDramDirectoryMSI
 {
+	static String cfgStringDefault(const String &key, const String &def)
+	{
+		return Sim()->getCfg()->hasKey(key) ? Sim()->getCfg()->getString(key) : def;
+	}
+
+	static int cfgIntDefault(const String &key, int def)
+	{
+		return Sim()->getCfg()->hasKey(key) ? Sim()->getCfg()->getInt(key) : def;
+	}
+
+	NestShared *NestShared::s_instance = nullptr;
+	std::mutex NestShared::s_init_lock;
+
+	NestShared* NestShared::get()
+	{
+		std::lock_guard<std::mutex> guard(s_init_lock);
+		if (!s_instance)
+			s_instance = new NestShared();
+		return s_instance;
+	}
+
+	NestShared::NestShared()
+	{
+		String mode = cfgStringDefault("perf_model/nest/mode", "cuckoo");
+		if (mode == "off")        m_mode = Mode::Off;
+		else if (mode == "ideal") m_mode = Mode::Ideal;
+		else                      m_mode = Mode::Cuckoo;
+
+		m_latency = SubsecondTime::NS(cfgIntDefault("perf_model/nest/latency_ns", 10));
+		int max_kicks = cfgIntDefault("perf_model/nest/max_kicks", 8);
+
+		m_num_page_sizes = Sim()->getCfg()->getInt("perf_model/nest/page_sizes");
+		m_ideal.resize(m_num_page_sizes);
+
+		for (int i = 0; i < m_num_page_sizes; i++)
+		{
+			int page_size = Sim()->getCfg()->getIntArray("perf_model/nest/page_size_list", i);
+			int entries   = Sim()->getCfg()->getIntArray("perf_model/nest/entries", i);
+			m_page_sizes.push_back(page_size);
+			m_tables.push_back(m_mode == Mode::Cuckoo
+			                   ? new NestCuckooTable(page_size, entries, max_kicks)
+			                   : nullptr);
+
+			std::cout << "[NEST] mode=" << mode << " page_size=" << page_size
+			          << " entries=" << entries << " latency_ns=" << m_latency.getNS() << std::endl;
+		}
+	}
+
+	bool NestShared::lookup(UInt16 asid, IntPtr address, IntPtr &ppn, int &page_size)
+	{
+		std::lock_guard<std::mutex> guard(m_lock);
+		for (int i = 0; i < m_num_page_sizes; i++)
+		{
+			int ps = m_page_sizes[i];
+			IntPtr vpn = address >> ps;
+			bool hit = false;
+
+			if (m_mode == Mode::Ideal)
+			{
+				auto it = m_ideal[i].find(idealKey(asid, vpn));
+				if (it != m_ideal[i].end()) { ppn = it->second; hit = true; }
+			}
+			else
+			{
+				hit = m_tables[i]->lookup(asid, vpn, ppn);
+			}
+
+			if (hit) { page_size = ps; return true; }
+		}
+		return false;
+	}
+
+	void NestShared::insert(UInt16 asid, IntPtr address, IntPtr ppn, int page_size,
+	                        size_t &kicks, bool &evicted)
+	{
+		std::lock_guard<std::mutex> guard(m_lock);
+		kicks = 0;
+		evicted = false;
+		for (int i = 0; i < m_num_page_sizes; i++)
+		{
+			if (m_page_sizes[i] != page_size)
+				continue;
+			IntPtr vpn = address >> page_size;
+			if (m_mode == Mode::Ideal)
+				m_ideal[i][idealKey(asid, vpn)] = ppn;
+			else
+				evicted = m_tables[i]->insert(asid, vpn, ppn, &kicks);
+			return;
+		}
+	}
+
 
 // ============================================================================
 // Construction / Destruction
@@ -73,8 +164,8 @@ namespace ParametricDramDirectoryMSI
 	                                                       MemoryManagementUnitBase *_nested_mmu)
 	: MemoryManagementUnitBase(_core, _memory_manager, _shmem_perf_model, _name, _nested_mmu),
 	  memory_manager(_memory_manager),
-	  m_nest_tables(nullptr),
-	  m_num_page_sizes(0)
+	  m_nest(nullptr),
+	  m_trace_file(nullptr)
 	{
 		// SimLog for debug output
 		mmu_nest_log = new SimLog("MMU_NEST", core->getId(), DEBUG_MMU_POMTLB);
@@ -96,14 +187,8 @@ namespace ParametricDramDirectoryMSI
 		delete pt_walkers;
 		delete[] translation_stats.tlb_latency_per_level;
 		delete[] translation_stats.tlb_hit_page_sizes;
-		if (m_nest_tables)
-		{
-			for (int i = 0; i < m_num_page_sizes; i++)
-			{
-				delete m_nest_tables[i];
-			}
-			delete[] m_nest_tables;
-		}
+		if (m_trace_file)
+			fclose(m_trace_file);
 	}
 
 // ============================================================================
@@ -154,20 +239,14 @@ namespace ParametricDramDirectoryMSI
 	{
 		// Create standard hardware TLB hierarchy
 		tlb_subsystem = new TLBHierarchy(name, core, memory_manager, shmem_perf_model);
+		m_nest = NestShared::get();
 
-		m_num_page_sizes = Sim()->getCfg()->getInt("perf_model/nest/page_sizes");
-		m_nest_tables = new NestCuckooTable*[m_num_page_sizes];
-
-		for (int i = 0; i < m_num_page_sizes; i++)
+		if (Sim()->getCfg()->getBoolDefault("perf_model/nest/trace_enabled", false))
 		{
-			int page_size = Sim()->getCfg()->getIntArray("perf_model/nest/page_size_list", i);
-			int entries   = Sim()->getCfg()->getIntArray("perf_model/nest/entries", i);
-
-			std::cout << "[MMU:NEST] Instantiating Cuckoo Table for page size: " 
-			          << page_size << " with " << entries << " total entries (" 
-			          << (entries / 4) << " entries/bank)" << std::endl;
-
-			m_nest_tables[i] = new NestCuckooTable(page_size, entries);
+			String prefix = cfgStringDefault("perf_model/nest/trace_prefix", "nest_trace");
+			String path = Sim()->getConfig()->formatOutputFileName(
+				prefix + "_core" + itostr(core->getId()) + ".bin");
+			m_trace_file = fopen(path.c_str(), "wb");
 		}
 	}
 
@@ -204,6 +283,9 @@ namespace ParametricDramDirectoryMSI
 		registerStatsMetric(name, core->getId(), "nest_insertions", &translation_stats.nest_insertions);
 		registerStatsMetric(name, core->getId(), "nest_kicks", &translation_stats.nest_kicks);
 		registerStatsMetric(name, core->getId(), "nest_evictions", &translation_stats.nest_evictions);
+		registerStatsMetric(name, core->getId(), "num_translations", &translation_stats.num_translations);
+		registerStatsMetric(name, core->getId(), "page_table_walks", &translation_stats.page_table_walks);
+		registerStatsMetric(name, core->getId(), "translations_with_fault", &translation_stats.translations_with_fault);
 
 		// Per-level TLB latency statistics
 		translation_stats.tlb_latency_per_level = new SubsecondTime[tlb_subsystem->getTLBSubsystem().size()];
@@ -270,7 +352,7 @@ namespace ParametricDramDirectoryMSI
 		// Track DRAM accesses for power/performance analysis
 		dram_accesses_during_last_walk = 0;
 
-		mmu_nest_log->debug("[MMU:NEST] ---- Starting address translation for virtual address: %lx ---- at time %s",
+		mmu_nest_log->debug("[MMU:NEST] ---- Starting address translation for virtual address: %lx ---- at time %lu",
 			address, shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS());
 
 		SubsecondTime time = shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD);
@@ -418,46 +500,34 @@ namespace ParametricDramDirectoryMSI
 		 *    (software_tlb_latency[i]) and pick either the one that hits or the max if all miss.
 		 */
 		bool nest_hit = false;
-
-		SubsecondTime time_before_nest = shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD);
 		SubsecondTime charged_nest_latency = SubsecondTime::Zero();
+		UInt16 asid = static_cast<UInt16>(core->getThread()->getAppId());
 
-		if (!tlb_hit)
+		if (!tlb_hit && m_nest->isEnabled())
 		{
+			SubsecondTime time_before_nest = shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD);
+			
 			if (count)
 				translation_stats.nest_lookups++;
 
-			for (int i = 0; i < m_num_page_sizes; i++)
-			{
-				int ps = m_nest_tables[i]->getPageSize();
-				IntPtr vpn = address >> ps;
-				IntPtr ppn_found = 0;
-
-				if (m_nest_tables[i]->lookup(vpn, ppn_found))
-				{
-					nest_hit = true;
-					ppn_result = ppn_found;
-					page_size_result = ps;
-					if (count)
-						translation_stats.nest_hits++;
-					break;
-				}
-			}
-
-			if (!nest_hit && count)
-				translation_stats.nest_misses++;
-
-			charged_nest_latency = SubsecondTime::NS(10);
+			nest_hit = m_nest->lookup(asid, address, ppn_result, page_size_result);
 
 			if (count)
-				translation_stats.software_tlb_latency += charged_nest_latency;
+			{
+				if (nest_hit) translation_stats.nest_hits++;
+				else          translation_stats.nest_misses++;
+			}
+
+			charged_nest_latency = m_nest->getLatency();
 
 			shmem_perf_model->setElapsedTime(ShmemPerfModel::_USER_THREAD,
 				time_before_nest + charged_nest_latency);
 
 			if (count)
+			{
+				translation_stats.software_tlb_latency += charged_nest_latency;
 				translation_stats.total_translation_latency += charged_nest_latency;
-			
+			}
 		}
 
 		/*
@@ -467,6 +537,7 @@ namespace ParametricDramDirectoryMSI
 		 */
 		SubsecondTime total_fault_latency = SubsecondTime::Zero();
 		SubsecondTime total_walk_latency  = SubsecondTime::Zero();
+		bool translation_had_fault = false;
 
 		if (!tlb_hit && !nest_hit)
 		{
@@ -511,7 +582,8 @@ namespace ParametricDramDirectoryMSI
 			{
 				had_page_fault = true;  // Track that a fault occurred
 				mmu_nest_log->debug("[MMU] Page Fault occured");
-				translation_stats.page_faults++;
+				if (count)
+					translation_stats.page_faults++;
 				
 				// Handle page fault at MMU level (sniper-space mode)
 				if (!userspace_mimicos_enabled)
@@ -530,6 +602,9 @@ namespace ParametricDramDirectoryMSI
 				}
 			}
 			} while (caused_page_fault && !userspace_mimicos_enabled);
+			translation_had_fault = had_page_fault;
+			if (had_page_fault && count)
+				translation_stats.translations_with_fault++;
 			
 			// Calculate fault latency for timing (after loop, fault should be resolved)
 			if (had_page_fault && !userspace_mimicos_enabled)
@@ -640,25 +715,18 @@ namespace ParametricDramDirectoryMSI
 		 * 6) Allocate the translation in the software TLB if we had a miss there. 
 		 *    We check each software TLB if it supports page_size_result and is "allocate on miss."
 		 */
-		if (!nest_hit && !tlb_hit)
+		if (!nest_hit && !tlb_hit && m_nest->isEnabled())
 		{
-			for (int i = 0; i < m_num_page_sizes; i++)
+			size_t kicks = 0;
+			bool evicted = false;
+			m_nest->insert(asid, address, ppn_result, page_size_result, kicks, evicted);
+
+			if (count)
 			{
-				if (m_nest_tables[i]->getPageSize() == page_size_result)
-				{
-					IntPtr vpn = address >> page_size_result;
-					size_t kicks = 0;
-					bool evicted = m_nest_tables[i]->insert(vpn, ppn_result, &kicks);
-					if (count)
-					{
-						translation_stats.nest_insertions++;
-						translation_stats.nest_kicks += kicks;
-						if (evicted)
-							translation_stats.nest_evictions++;
-					}
-					mmu_nest_log->debug("[MMU:NEST] Inserted VPN=%lx -> PPN=%lx in L3 table after PTW", vpn, ppn_result);
-					break;
-				}
+				translation_stats.nest_insertions++;
+				translation_stats.nest_kicks += kicks;
+				if (evicted)
+					translation_stats.nest_evictions++;
 			}
 		}
 
@@ -679,6 +747,17 @@ namespace ParametricDramDirectoryMSI
 		mmu_nest_log->debug("[MMU] Physical Address: %lx PPN: %lx Page Size: %d", final_physical_address, ppn_result*base_page_size_in_bytes, page_size_result);
 		mmu_nest_log->debug("[MMU] Total translation latency: %lu", (charged_tlb_latency + charged_nest_latency + total_walk_latency).getNS());
 		mmu_nest_log->debug("[MMU] ---- Ending address translation for virtual address: %lx ----", address);
+
+		if (m_trace_file && !tlb_hit && count)
+		{
+			NestTraceRecord rec;
+			rec.time_ns   = shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS();
+			rec.vpn4k     = address >> 12;
+			rec.asid      = asid;
+			rec.page_size = static_cast<UInt8>(page_size_result);
+			rec.flags     = (nest_hit ? 0x1 : 0x0) | (translation_had_fault ? 0x2 : 0x0);
+			fwrite(&rec, sizeof(rec), 1, m_trace_file);
+		}
 
 		return final_physical_address;
 	}
