@@ -4,18 +4,120 @@ trace_suite:
     tracelists:
       - nest_rnd.tlist
 
+  real4:
+    tracelist_base_path: vm_tlist/
+    tracelists:
+      - nest_k20_real.tlist
+
+  graphs:
+    tracelist_base_path: vm_tlist/
+    tracelists:
+      - nest_k20_graphs.tlist
+
 configs:
   configs_base_path: ../simulator/sniper/config/address_translation_schemes/
-  nest-test:
-    name: nest-test
-    file: reservethp_nest.cfg
+
+  k20-baseline:
+    name: k20-baseline
+    file: kratos20_baseline.cfg
+    description: Cascade Lake baseline (radix 4 niveaux, sans NEST)
+
+  k20-nest-off:
+    name: k20-nest-off
+    file: kratos20_nest.cfg
+    extends:
+      - --perf_model/nest/mode=off
+    description: Vérification, doit donner exactement k20-baseline
+
+  k20-nest-ideal:
+    name: k20-nest-ideal
+    file: kratos20_nest.cfg
     extends:
       - --perf_model/nest/mode=ideal
-    description: NEST ideal, pipeline test
+    description: NEST de capacité infinie
+
+  k20-nest-cuckoo:
+    name: k20-nest-cuckoo
+    file: kratos20_nest.cfg
+    description: NEST cuckoo (1M entrées 4K + 4K entrées 2M, valeurs du cfg)
+
+  k20-nest-lat:
+    name: k20-nest-lat
+    file: kratos20_nest.cfg
+    extends:
+      - --perf_model/nest/mode=ideal
+    sweeps:
+      - identifier: "lat"
+        option: "--perf_model/nest/latency_ns="
+        values: [15, 20, 25, 30, 35, 40, 50, 60]
+    description: NEST ideal, balayage de la latence d'accès (ns)
+
+  k20-nest-cuckoo-lat:
+    name: k20-nest-cuckoo-lat
+    file: kratos20_nest.cfg
+    sweeps:
+      - identifier: "lat"
+        option: "--perf_model/nest/latency_ns="
+        values: [10, 30]
+    description: NEST cuckoo 1M entrées, 10 et 30 ns
+
+  k20-nest-ideal-lat:
+    name: k20-nest-ideal-lat
+    file: kratos20_nest.cfg
+    extends:
+      - --perf_model/nest/mode=ideal
+    sweeps:
+      - identifier: "lat"
+        option: "--perf_model/nest/latency_ns="
+        values: [10, 30]
+    description: NEST ideal (capacité infinie), 10 et 30 ns
 
 experiment_suites:
-  nest-test:
-    description: Pipeline test - NEST ideal on rnd, 10M instructions
-    configs: [nest-test]
+  k20-sanity:
+    description: Kratos20 - baseline vs NEST off, doivent être identiques
+    configs: [k20-baseline, k20-nest-off]
     trace_suite: rnd
     instruction_count: 10000000
+    warmup_instructions: 0
+
+  k20-first:
+    description: Kratos20 - baseline vs NEST ideal vs cuckoo sur rnd, 30M
+    configs: [k20-baseline, k20-nest-ideal, k20-nest-cuckoo]
+    trace_suite: rnd
+    instruction_count: 30000000
+    warmup_instructions: 0
+
+  k20-latency:
+    description: Kratos20 - seuil de rentabilité de la latence NEST sur rnd, 30M
+    configs: [k20-nest-lat]
+    trace_suite: rnd
+    instruction_count: 30000000
+    warmup_instructions: 0
+
+  k20-real:
+    description: Kratos20 - baseline vs NEST cuckoo 10/30 ns sur cc, bfs, xs, pr, 30M
+    configs: [k20-baseline, k20-nest-cuckoo-lat]
+    trace_suite: real4
+    instruction_count: 30000000
+    warmup_instructions: 0
+
+  k20-warm-speed:
+    description: Mesure de la vitesse du warmup - baseline rnd, 100M warmup + 1M
+    configs: [k20-baseline]
+    trace_suite: rnd
+    instruction_count: 1000000
+    warmup_instructions: 100000000
+
+  k20-real-w30:
+    description: Kratos20 - baseline vs NEST cuckoo 10/30 ns, 30M warmup + 10M mesurées
+    configs: [k20-baseline, k20-nest-cuckoo-lat]
+    trace_suite: real4
+    instruction_count: 10000000
+    warmup_instructions: 30000000
+
+  k20-real-w100:
+    description: Kratos20 - baseline vs NEST ideal 10/30 ns sur les graphes, 100M warmup + 10M mesurées
+    configs: [k20-baseline, k20-nest-ideal-lat]
+    trace_suite: graphs
+    instruction_count: 10000000
+    warmup_instructions: 100000000

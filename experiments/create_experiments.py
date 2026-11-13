@@ -1,3 +1,5 @@
+DEFAULT_WARMUP_INSTRUCTIONS = 100_000_000
+
 
 import os
 import argparse
@@ -328,6 +330,7 @@ def build_jobfile(
     slurm_partitions: List[str] = None,
     slurm_exclude: str = None,
     tracelist_instruction_overrides: Dict[str, int] = None,
+    warmup_count: int = 0,
 ) -> List[Tuple[str, str, str, str]]:
     jobs: List[Tuple[str, str, str, str]] = []  # (id, cfg_name, trace_name, out_dir)
 
@@ -345,7 +348,10 @@ def build_jobfile(
                         if tlist_name == tl_pattern or tlist_name.startswith(tl_pattern):
                             icount = tl_icount
                             break
-                sniper_parameters = f" --no-cache-warming --genstats -s stop-by-icount:{icount}"
+                if warmup_count > 0:
+                    sniper_parameters = f" --genstats -s stop-by-icount:{icount}:{warmup_count} --roi-script"
+                else:
+                    sniper_parameters = f" --no-cache-warming --genstats -s stop-by-icount:{icount}"
 
                 # Sanitize names for directory/file usage (remove commas, etc.)
                 safe_cfg_name = sanitize_dirname(cfg_name)
@@ -486,6 +492,7 @@ Examples:
     all_cfg_names: List[str] = []
     all_trace_suite_names: set = set()
     instruction_count: int = 0
+    warmup_count: int = -1
     yaml_icache_prefixes: List[str] = []
     yaml_slurm_partitions: List[str] = []
 
@@ -497,6 +504,8 @@ Examples:
         # Use the maximum instruction count across all suites
         suite_instr = int(suite.get("instruction_count", 300_000_000))
         instruction_count = max(instruction_count, suite_instr)
+        suite_warmup = int(suite.get("warmup_instructions", DEFAULT_WARMUP_INSTRUCTIONS))
+        warmup_count = max(warmup_count, suite_warmup)
         # Collect enable_icache_for prefixes from YAML suite definition
         suite_icache = suite.get("enable_icache_for", [])
         if isinstance(suite_icache, str):
@@ -580,6 +589,7 @@ Examples:
         slurm_partitions=slurm_partitions,
         slurm_exclude=args.exclude,
         tracelist_instruction_overrides=tracelist_instruction_overrides or None,
+        warmup_count=warmup_count,
     )
 
     write_csv(job_list_path, ["job_id", "config_name", "trace_name", "output_dir"], jobs)
@@ -591,6 +601,7 @@ Examples:
     print(f"  {Colors.BOLD}Instructions:{Colors.RESET} {Colors.GREEN}{instruction_count}{Colors.RESET}")
     print(f"  {Colors.BOLD}Traces:{Colors.RESET} {Colors.GREEN}{len(traces)}{Colors.RESET} -> {trace_list_path}")
     print(f"  {Colors.BOLD}Configs:{Colors.RESET} {Colors.GREEN}{len(configs)}{Colors.RESET} -> {config_list_path}")
+    print(f"  {Colors.BOLD}Warmup:{Colors.RESET} {Colors.GREEN}{warmup_count}{Colors.RESET}")
     if icache_prefixes:
         print(f"  {Colors.BOLD}iCache for:{Colors.RESET} {Colors.YELLOW}{', '.join(icache_prefixes)}*{Colors.RESET} traces only")
     if tracelist_instruction_overrides:

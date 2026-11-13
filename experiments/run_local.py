@@ -11,6 +11,11 @@ Usage:
     python3 run_local.py experiments/exp_x/jobfile.sh -j 48
     python3 run_local.py experiments/exp_x/jobfile.sh -j 48 --dry-run
     python3 run_local.py experiments/exp_x/jobfile.sh -j 48 --skip-done
+    python3 run_local.py experiments/exp_x/jobfile.sh -j 48 --results-dir ~/nest_results/exp_x
+
+--results-dir DIR makes every run write its outputs to DIR/<run>/ instead of the
+suite's results/ folder (e.g. a home directory that survives the node), and
+keeps a log of this script's own output in DIR/run_local.log.
 """
 
 import argparse
@@ -53,6 +58,37 @@ def parse_jobfile(path):
     return jobs
 
 
+def redirect_results(jobs, new_root):
+    """Rewrite each job so that its outputs go to new_root/<run>/.
+
+    The jobfile's results folder is the parent of every run folder
+    (<suite>/results/<run>/slurm.out); it is replaced everywhere it appears:
+    the -d option of the command, --output and --error.
+    """
+    new_root = os.path.abspath(os.path.expanduser(new_root))
+    for job in jobs:
+        old_root = os.path.dirname(os.path.dirname(job["out"]))
+        job["cmd"] = job["cmd"].replace(old_root + "/", new_root + "/")
+        job["out"] = job["out"].replace(old_root + "/", new_root + "/", 1)
+        job["err"] = job["err"].replace(old_root + "/", new_root + "/", 1)
+    return new_root
+
+
+class Tee:
+    """Write to the terminal and to a log file at the same time."""
+    def __init__(self, path):
+        self.f = open(path, "a", buffering=1)
+        self.term = sys.stdout
+
+    def write(self, s):
+        self.term.write(s)
+        self.f.write(s)
+
+    def flush(self):
+        self.term.flush()
+        self.f.flush()
+
+
 def is_done(job):
     d = os.path.dirname(job["out"])
     return any(os.path.exists(os.path.join(d, p))
@@ -78,9 +114,18 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--skip-done", action="store_true",
                     help="skip runs whose output dir already has sim.stats")
+    ap.add_argument("--results-dir", default=None, metavar="DIR",
+                    help="write every run's outputs to DIR/<run>/ (e.g. in your home)")
     args = ap.parse_args()
 
     jobs = parse_jobfile(args.jobfile)
+    if args.results_dir:
+        root = redirect_results(jobs, args.results_dir)
+        if not args.dry_run:
+            os.makedirs(root, exist_ok=True)
+            sys.stdout = Tee(os.path.join(root, "run_local.log"))
+            print(f"[info] {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(sys.argv)}")
+        print(f"[info] results go to {root}")
     if args.skip_done:
         before = len(jobs)
         jobs = [j for j in jobs if not is_done(j)]
